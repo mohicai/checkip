@@ -5,10 +5,9 @@ from datetime import datetime
 
 # --- 配置区 ---
 URL_LIST_FILE = 'url.txt'
+OUTPUT_FILE = 'valid_ips.txt'  # 保存有效 IP 的文件名
 CHECK_API = 'https://api.090227.xyz/check'
 CONCURRENT_LIMIT = 50
-
-
 
 # 脚本会自动从 GitHub Actions 的运行环境中读取这些加密后的值
 CF_API_TOKEN = os.getenv('CF_API_TOKEN')
@@ -48,6 +47,11 @@ async def check_proxy(session, ip, semaphore):
     return None
 
 async def update_cf_dns(valid_ips):
+    # 检查环境变量
+    if not CF_API_TOKEN or not CF_ZONE_ID:
+        log("缺失 CF 环境变量，跳过 DNS 更新步骤", "WARNING")
+        return
+
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json"
@@ -67,7 +71,6 @@ async def update_cf_dns(valid_ips):
         if records:
             log(f"发现 {len(records)} 条属于 {DNS_RECORD_NAME} 的旧记录，准备清理...")
             for r in records:
-                # 再次核对域名，双重保险
                 if r['name'] == DNS_RECORD_NAME:
                     async with session.delete(f"{base_url}/{r['id']}") as del_resp:
                         if del_resp.status == 200:
@@ -80,7 +83,7 @@ async def update_cf_dns(valid_ips):
         
         # 3. 批量添加新记录
         if not valid_ips:
-            log("没有可用的有效 IP，本次不更新 DNS。", "WARNING")
+            log("没有可用的有效 IP，本次不写入 DNS。", "WARNING")
             return
 
         log(f"准备写入 {len(valid_ips)} 条新记录到 {DNS_RECORD_NAME}...")
@@ -94,16 +97,12 @@ async def update_cf_dns(valid_ips):
             }
             async with session.post(base_url, json=payload) as add_resp:
                 if add_resp.status == 200:
-                    log(f"成功写入记录: {ip}", "SUCCESS")
+                    log(f"成功写入 CF 记录: {ip}", "SUCCESS")
                 else:
                     err_msg = await add_resp.text()
-                    log(f"写入失败 {ip}: {err_msg}", "ERROR")
+                    log(f"写入 CF 失败 {ip}: {err_msg}", "ERROR")
 
 async def main():
-    if not CF_API_TOKEN or not CF_ZONE_ID:
-        log("缺失环境变量 CF_API_TOKEN 或 CF_ZONE_ID", "ERROR")
-        return
-
     start_time = datetime.now()
     log("=== 任务开始 ===")
 
@@ -128,7 +127,15 @@ async def main():
         valid_ips = [r for r in check_results if r]
         log(f"检测结束。发现可用 IP: {len(valid_ips)} 个")
 
-        # 更新 DNS
+        # 保存结果到本地文件
+        try:
+            with open(OUTPUT_FILE, 'w') as f:
+                f.write('\n'.join(valid_ips))
+            log(f"结果已同步保存至本地文件: {OUTPUT_FILE}", "SUCCESS")
+        except Exception as e:
+            log(f"保存文件失败: {str(e)}", "ERROR")
+
+        # 执行 DNS 更新
         await update_cf_dns(valid_ips)
 
     duration = datetime.now() - start_time
