@@ -13,6 +13,7 @@ CONCURRENT_LIMIT = 50
 # 脚本会自动从 GitHub Actions 的运行环境中读取这些加密后的值
 CF_API_TOKEN = os.getenv('CF_API_TOKEN')
 CF_ZONE_ID = os.getenv('CF_ZONE_ID')
+
 DNS_RECORD_NAME = 'dns.mtd.dpdns.org'
 # --- --- --- ---
 
@@ -42,7 +43,6 @@ async def check_proxy(session, ip, semaphore):
                 if data.get('success') is True:
                     log(f"检测通过: {ip}", "PASS")
                     return ip
-                log(f"检测失败: {ip}", "fail")
         except:
             pass
     return None
