@@ -42,6 +42,7 @@ async def check_proxy(session, ip, semaphore):
                 if data.get('success') is True:
                     log(f"检测通过: {ip}", "PASS")
                     return ip
+                log(f"检测失败: {ip}", "fail")
         except:
             pass
     return None
