@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import os
+import ipaddress  # 引入 IP 地址处理库
 from datetime import datetime
 
 # --- 配置区 ---
@@ -27,12 +28,38 @@ async def fetch_ips(session, url):
             if resp.status == 200:
                 text = await resp.text()
                 ips = [line.strip() for line in text.splitlines() if line.strip()]
-                log(f"成功从 {url} 获取到 {len(ips)} 个 IP", "SUCCESS")
+                log(f"成功从 {url} 获取到 {len(ips)} 行数据(含潜在网段)", "SUCCESS")
                 return ips
             log(f"读取失败 {url}, 状态码: {resp.status}", "WARNING")
     except Exception as e:
         log(f"访问异常 {url}: {str(e)}", "ERROR")
     return []
+
+def parse_and_expand_ips(raw_lines):
+    """
+    解析原始数据：如果是单个 IP 直接保留；如果是 CIDR 网段则解开为单个 IP。
+    同时自动过滤非法的 IP 格式。
+    """
+    expanded_ips = set()
+    for line in raw_lines:
+        line = line.strip()
+        if not line or line.startswith('#'): # 略过空行或注释
+            continue
+        try:
+            # 尝试将其作为网段或单个IP解析
+            network = ipaddress.ip_network(line, strict=False)
+            # num_addresses 可以获取该网段包含的 IP 数量
+            # 避免意外填入巨大的网段（如 /8）导致内存溢出，这里做个安全限制（例如最大释放 65536 个 IP，即 /16）
+            if network.num_addresses > 65536:
+                log(f"网段过多或范围过大，已跳过: {line} (包含 {network.num_addresses} 个 IP)", "WARNING")
+                continue
+                
+            for ip in network:
+                expanded_ips.add(str(ip))
+        except ValueError:
+            # 格式不符合 IP 或网段，可能是域名或乱码，直接忽略
+            pass
+    return list(expanded_ips)
 
 async def check_proxy(session, ip, semaphore):
     async with semaphore:
@@ -47,7 +74,6 @@ async def check_proxy(session, ip, semaphore):
     return None
 
 async def update_cf_dns(valid_ips):
-    # 检查环境变量
     if not CF_API_TOKEN or not CF_ZONE_ID:
         log("缺失 CF 环境变量，跳过 DNS 更新步骤", "WARNING")
         return
@@ -59,7 +85,6 @@ async def update_cf_dns(valid_ips):
     base_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        # 1. 获取现有记录
         log(f"开始查询 Cloudflare 记录: {DNS_RECORD_NAME} ...")
         async with session.get(base_url, params={"name": DNS_RECORD_NAME, "type": "A"}) as resp:
             if resp.status != 200:
@@ -67,7 +92,6 @@ async def update_cf_dns(valid_ips):
                 return
             records = (await resp.json()).get('result', [])
 
-        # 2. 安全删除旧记录
         if records:
             log(f"发现 {len(records)} 条属于 {DNS_RECORD_NAME} 的旧记录，准备清理...")
             for r in records:
@@ -81,7 +105,6 @@ async def update_cf_dns(valid_ips):
         else:
             log("未发现旧记录，无需清理。", "INFO")
         
-        # 3. 批量添加新记录
         if not valid_ips:
             log("没有可用的有效 IP，本次不写入 DNS。", "WARNING")
             return
@@ -116,10 +139,19 @@ async def main():
         
         log(f"正在处理 {len(urls)} 个订阅源 URL...")
         fetch_results = await asyncio.gather(*(fetch_ips(session, u) for u in urls))
-        all_ips = list(set([ip for sub in fetch_results for ip in sub]))
         
-        log(f"去重后共计 {len(all_ips)} 个候选 IP，启动 {CONCURRENT_LIMIT} 并发检测...")
+        # 整合所有行数据
+        all_raw_lines = [line for sub in fetch_results for line in sub]
         
+        # 【核心修改点】调用解析函数，将包含的 CIDR 网段彻底展开为独立 IP 并去重
+        all_ips = parse_and_expand_ips(all_raw_lines)
+        
+        log(f"网段解开并去重后，共计 {len(all_ips)} 个候选 IP，启动 {CONCURRENT_LIMIT} 并发检测...")
+        
+        if not all_ips:
+            log("没有解析到任何有效的候选 IP，任务结束。", "WARNING")
+            return
+
         semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
         check_tasks = [check_proxy(session, ip, semaphore) for ip in all_ips]
         check_results = await asyncio.gather(*check_tasks)
@@ -127,7 +159,6 @@ async def main():
         valid_ips = [r for r in check_results if r]
         log(f"检测结束。发现可用 IP: {len(valid_ips)} 个")
 
-        # 保存结果到本地文件
         try:
             with open(OUTPUT_FILE, 'w') as f:
                 f.write('\n'.join(valid_ips))
@@ -135,7 +166,6 @@ async def main():
         except Exception as e:
             log(f"保存文件失败: {str(e)}", "ERROR")
 
-        # 执行 DNS 更新
         await update_cf_dns(valid_ips)
 
     duration = datetime.now() - start_time
